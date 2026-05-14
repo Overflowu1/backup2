@@ -1381,6 +1381,8 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
     clean_prior_weight = 0.02
     clean_focal_alpha = 0.75
     clean_focal_gamma = 2.0
+    clean_semantic_dice_weight = 1.0
+    clean_frac_dice_weight = 1.0
     clean_anatomy_schedule_epoch = 40
 
     # Predicted-structure SCI and geometry-aware fracture loss
@@ -1467,6 +1469,8 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             prior=self.clean_prior_weight,
             focal_alpha=self.clean_focal_alpha,
             focal_gamma=self.clean_focal_gamma,
+            semantic_dice=getattr(self, "clean_semantic_dice_weight", 1.0),
+            frac_dice=getattr(self, "clean_frac_dice_weight", 1.0),
             small_component=getattr(self, "clean_small_component_weight", 0.25),
             geometry=getattr(self, "clean_geometry_weight", 0.50),
             struct=getattr(self, "clean_struct_weight", 0.10),
@@ -1779,6 +1783,30 @@ class AGSSArconvLstmASFEBTrainer_Clean_HipOnly(AGSSArconvLstmASFEBTrainer_Clean)
     clean_anatomy_weight = 0.35
     clean_anatomy_weight_late = 0.15
     clean_prior_weight = 0.03
+
+
+
+class AGSSArconvLstmASFEBTrainer_Clean_HipOnly_FastLoss(AGSSArconvLstmASFEBTrainer_Clean_HipOnly):
+    """Fast hip-only profile that avoids duplicate heavy loss terms.
+
+    The final semantic output is assembled from anatomy + fracture predictions, so
+    full 5-class CE+Dice, binary fracture Dice, anatomy CE, structure BCE/L1 and
+    priors are partially redundant. This variant keeps the hierarchy trainable but
+    makes semantic supervision CE-only, downweights/downsames structure supervision,
+    and disables expensive geometry/small-component weighting for speed.
+    """
+    clean_semantic_weight = 0.50
+    clean_semantic_dice_weight = 0.0
+    clean_frac_weight = 1.00
+    clean_frac_dice_weight = 0.50
+    clean_anatomy_weight = 0.20
+    clean_anatomy_weight_late = 0.08
+    clean_struct_weight = 0.02
+    clean_struct_downsample_factor = 4
+    clean_geometry_weight = 0.0
+    clean_small_component_weight = 0.0
+    clean_prior_weight = 0.0
+    agss_clean_val_metrics_every = 10
 
 class AGSSArconvLstmASFEBTrainer_Clean_NoACFA(AGSSArconvLstmASFEBTrainer_Clean):
     """Ablation: Clean model without ACFA. Tests ACFA's contribution."""

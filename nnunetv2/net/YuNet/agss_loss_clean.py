@@ -154,12 +154,19 @@ def _split_agss_target(target, fracture_label: int = 4):
 # Loss components
 # ---------------------------------------------------------------------------
 
-def multiclass_ce_dice_loss(logits: torch.Tensor, target: torch.Tensor, num_classes: int) -> torch.Tensor:
+def multiclass_ce_dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    num_classes: int,
+    dice_weight: float = 1.0,
+) -> torch.Tensor:
     logits_f = _finite_logits(logits, clamp=30.0)
     target = _resize_target_like(target.float(), logits_f, "nearest")[:, 0].long()
     safe_target = target.clamp(0, num_classes - 1)
 
     ce = F.cross_entropy(logits_f, safe_target, reduction="mean")
+    if float(dice_weight) <= 0:
+        return _finite_loss(ce, posinf=20.0)
 
     prob = torch.softmax(logits_f, dim=1)
     onehot = F.one_hot(safe_target, num_classes=num_classes).permute(0, 4, 1, 2, 3).to(prob.dtype)
@@ -168,7 +175,7 @@ def multiclass_ce_dice_loss(logits: torch.Tensor, target: torch.Tensor, num_clas
     denom = prob.sum(axes) + onehot.sum(axes)
     dice_per_class = (2.0 * inter + 1e-6) / (denom + 1e-6)
     dice = 1.0 - dice_per_class[1:].mean()
-    return _finite_loss(ce + dice, posinf=20.0)
+    return _finite_loss(ce + float(dice_weight) * dice, posinf=20.0)
 
 
 def focal_bce_dice_loss(
@@ -180,6 +187,7 @@ def focal_bce_dice_loss(
     small_component_weight: float = 0.0,
     struct_fields: torch.Tensor | None = None,
     geometry_weight: float = 0.0,
+    dice_weight: float = 1.0,
 ) -> torch.Tensor:
     """
     Geometry-aware focal BCE + weighted Dice for fracture head.
@@ -217,12 +225,15 @@ def focal_bce_dice_loss(
     alpha_t = target * float(alpha) + (1.0 - target) * (1.0 - float(alpha))
     focal_bce = (alpha_t * focal_weight * bce * voxel_weight).mean()
 
+    if float(dice_weight) <= 0:
+        return _finite_loss(focal_bce, posinf=20.0)
+
     axes = (0,) + tuple(range(2, logits_f.ndim))
     inter = (prob * target * voxel_weight).sum(axes)
     denom = (prob * voxel_weight).sum(axes) + (target * voxel_weight).sum(axes)
     dice = 1.0 - ((2.0 * inter + 1e-6) / (denom + 1e-6)).mean()
 
-    return _finite_loss(focal_bce + dice, posinf=20.0)
+    return _finite_loss(focal_bce + float(dice_weight) * dice, posinf=20.0)
 
 
 def bce_dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -326,6 +337,8 @@ class CleanLossWeights:
     prior: float = 0.02
     focal_alpha: float = 0.75
     focal_gamma: float = 2.0
+    semantic_dice: float = 1.0
+    frac_dice: float = 1.0
     small_component: float = 0.25
     geometry: float = 0.50
     struct: float = 0.10
@@ -377,7 +390,12 @@ class AGSSCleanLoss(torch.nn.Module):
 
         seg_pred = _highest_resolution(output["seg"])
 
-        loss = self.weights.semantic * multiclass_ce_dice_loss(seg_pred, sem_t, num_classes=seg_pred.shape[1])
+        loss = self.weights.semantic * multiclass_ce_dice_loss(
+            seg_pred,
+            sem_t,
+            num_classes=seg_pred.shape[1],
+            dice_weight=self.weights.semantic_dice,
+        )
 
         if "struct" in output and self.weights.struct > 0:
             loss = loss + self.weights.struct * structure_field_loss(
@@ -403,6 +421,7 @@ class AGSSCleanLoss(torch.nn.Module):
                 small_component_weight=small_w,
                 struct_fields=struct_t,
                 geometry_weight=geometry_w,
+                dice_weight=self.weights.frac_dice,
             )
 
         anat_w = self._anatomy_weight()
