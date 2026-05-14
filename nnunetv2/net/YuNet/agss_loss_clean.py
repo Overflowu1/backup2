@@ -62,6 +62,28 @@ def _finite_loss(loss: torch.Tensor, nan: float = 0.0, posinf: float = 20.0, neg
     return torch.nan_to_num(loss, nan=float(nan), posinf=float(posinf), neginf=float(neginf))
 
 
+def _loss_downsample_pair(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    factor: int,
+    target_mode: str = "trilinear",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Downsample dense loss tensors to cut high-resolution auxiliary cost."""
+    factor = int(factor)
+    if factor <= 1 or min(pred.shape[2:]) < factor * 2:
+        return pred, target
+    spatial = tuple(max(1, int(i) // factor) for i in pred.shape[2:])
+    dims = pred.ndim - 2
+    pred_mode = "trilinear" if dims == 3 else "bilinear"
+    pred_small = F.interpolate(pred, size=spatial, mode=pred_mode, align_corners=False)
+    if target_mode == "nearest":
+        target_small = F.interpolate(target.float(), size=spatial, mode="nearest")
+    else:
+        interp_mode = "trilinear" if dims == 3 else "bilinear"
+        target_small = F.interpolate(target.float(), size=spatial, mode=interp_mode, align_corners=False)
+    return pred_small, target_small
+
+
 # ---------------------------------------------------------------------------
 # Split AGSS target
 # ---------------------------------------------------------------------------
@@ -220,6 +242,7 @@ def structure_field_loss(
     struct_logits: torch.Tensor,
     struct_target: torch.Tensor,
     frac_target: torch.Tensor | None = None,
+    downsample_factor: int = 1,
 ) -> torch.Tensor:
     """
     Supervise predicted structure fields:
@@ -229,6 +252,9 @@ def structure_field_loss(
     """
     logits_f = _finite_logits(struct_logits, clamp=30.0)
     struct_target = _resize_target_like(struct_target.float(), logits_f, "trilinear")
+    logits_f, struct_target = _loss_downsample_pair(
+        logits_f, struct_target, int(downsample_factor), target_mode="trilinear"
+    )
     struct_target = torch.nan_to_num(struct_target, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
     pred = torch.sigmoid(logits_f)
@@ -303,6 +329,9 @@ class CleanLossWeights:
     small_component: float = 0.25
     geometry: float = 0.50
     struct: float = 0.10
+    geometry_start_epoch: int = 20
+    small_component_start_epoch: int = 40
+    struct_downsample_factor: int = 2
 
 
 class AGSSCleanLoss(torch.nn.Module):
@@ -355,18 +384,25 @@ class AGSSCleanLoss(torch.nn.Module):
                 _highest_resolution(output["struct"]),
                 struct_t,
                 frac_target=frac_t,
+                downsample_factor=self.weights.struct_downsample_factor,
             )
 
         if "frac" in output and self.weights.frac > 0:
+            geometry_w = self.weights.geometry if self.current_epoch >= self.weights.geometry_start_epoch else 0.0
+            small_w = (
+                self.weights.small_component
+                if self.current_epoch >= self.weights.small_component_start_epoch
+                else 0.0
+            )
             loss = loss + self.weights.frac * focal_bce_dice_loss(
                 _highest_resolution(output["frac"]),
                 frac_t,
                 alpha=self.weights.focal_alpha,
                 gamma=self.weights.focal_gamma,
                 small_weight_target=small_weight_t,
-                small_component_weight=self.weights.small_component,
+                small_component_weight=small_w,
                 struct_fields=struct_t,
-                geometry_weight=self.weights.geometry,
+                geometry_weight=geometry_w,
             )
 
         anat_w = self._anatomy_weight()
