@@ -1465,11 +1465,13 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             anatomy_late=self.clean_anatomy_weight_late,
             sacfrac=self.clean_sacfrac_weight,
             prior=self.clean_prior_weight,
+            sacrum_exclusion=getattr(self, "clean_sacrum_exclusion_weight", 0.0),
             focal_alpha=self.clean_focal_alpha,
             focal_gamma=self.clean_focal_gamma,
             small_component=getattr(self, "clean_small_component_weight", 0.25),
             geometry=getattr(self, "clean_geometry_weight", 0.50),
             struct=getattr(self, "clean_struct_weight", 0.10),
+            side_focal_gamma=getattr(self, "clean_side_focal_gamma", 0.0),
             geometry_start_epoch=getattr(self, "clean_geometry_start_epoch", 20),
             small_component_start_epoch=getattr(self, "clean_small_component_start_epoch", 40),
             struct_downsample_factor=getattr(self, "clean_struct_downsample_factor", 2),
@@ -1617,6 +1619,7 @@ AGSS_CLEAN_VAL_METRIC_KEYS = [
     'agss_val_arconv_lite_routing_entropy', 'agss_val_arconv_lite_routing_max_prob',
     'agss_val_arconv_lite_res_scale',
     'agss_val_core_mae', 'agss_val_surface_mae', 'agss_val_struct_roi_mae',
+    'agss_val_left_to_right_frac', 'agss_val_right_to_left_frac',
 ]
 
 
@@ -1707,6 +1710,15 @@ def _compute_agss_validation_metrics_clean(output, target, fracture_label=4, ign
                 if frac_anat_gt.numel() > 0:
                     metrics['agss_val_frac_anat_acc'] = (pred_anat[gt_frac] == frac_anat_gt).float().mean().detach().cpu().numpy()
 
+                # Left-right fracture confusion: among fracture GT voxels on left/right hip,
+                # what fraction is mis-assigned to the opposite side by the anatomy head?
+                gt_frac_left = gt_frac & (anat_gt == 2)  # fracture on left hip
+                gt_frac_right = gt_frac & (anat_gt == 3)  # fracture on right hip
+                if bool(gt_frac_left.any().item()):
+                    metrics['agss_val_left_to_right_frac'] = (pred_anat[gt_frac_left] == 3).float().mean().detach().cpu().numpy()
+                if bool(gt_frac_right.any().item()):
+                    metrics['agss_val_right_to_left_frac'] = (pred_anat[gt_frac_right] == 2).float().mean().detach().cpu().numpy()
+
     # Sacfrac metrics
     sacfrac_logits = output.get('sacfrac', None)
     if sacfrac_logits is not None and sacfrac_gt is not None and torch.is_tensor(sacfrac_logits):
@@ -1768,6 +1780,10 @@ class AGSSArconvLstmASFEBTrainer_Clean_HipOnly(AGSSArconvLstmASFEBTrainer_Clean)
     Removes the sacrum-fracture auxiliary head/loss and shifts sampling/model
     selection toward fracture and left/right hip anatomy. The main semantic
     hierarchy still keeps sacrum as an anatomy class if labels contain it.
+
+    Adds sacrum exclusion penalty (explicitly suppresses fracture predictions
+    on sacrum) and focal side-head loss (harder gradient on ambiguous left/right
+    voxels).
     """
     agss_use_sacfrac_head = False
     clean_sacfrac_weight = 0.0
@@ -1778,6 +1794,8 @@ class AGSSArconvLstmASFEBTrainer_Clean_HipOnly(AGSSArconvLstmASFEBTrainer_Clean)
     clean_anatomy_weight = 0.35
     clean_anatomy_weight_late = 0.15
     clean_prior_weight = 0.03
+    clean_sacrum_exclusion_weight = 0.02
+    clean_side_focal_gamma = 1.0
 
 class AGSSArconvLstmASFEBTrainer_Clean_NoACFA(AGSSArconvLstmASFEBTrainer_Clean):
     """Ablation: Clean model without ACFA. Tests ACFA's contribution."""
