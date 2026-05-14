@@ -105,7 +105,7 @@ def assemble_anatomy_probs(region_logits: torch.Tensor, side_logits: torch.Tenso
         side_lr = ps[:, 1:3]
         side_lr = side_lr / side_lr.sum(1, keepdim=True).clamp_min(eps)
         probs = torch.cat(
-            [pr[:, 0:1], pr[:, 1:2], hip * side_lr[:, 1:2], hip * side_lr[:, 0:1]],
+            [pr[:, 0:1], pr[:, 1:2], hip * side_lr[:, 0:1], hip * side_lr[:, 1:2]],
             dim=1,
         )
         probs = probs / probs.sum(1, keepdim=True).clamp_min(eps)

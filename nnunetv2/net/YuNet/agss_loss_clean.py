@@ -277,7 +277,12 @@ def region_ce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return _finite_loss(F.cross_entropy(logits_f, safe_target, reduction="mean"), posinf=20.0)
 
 
-def masked_side_ce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def masked_side_ce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    focal_gamma: float = 0.0,
+) -> torch.Tensor:
+    """Masked CE on hip voxels, with optional focal weighting for left/right ambiguity."""
     logits_f = _finite_logits(logits, clamp=30.0)
     target = _resize_target_like(target.float(), logits_f, "nearest")[:, 0].long()
     safe_target = target.clamp(0, 2)
@@ -285,6 +290,12 @@ def masked_side_ce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Ten
     if mask.sum() < 8:
         return logits_f.new_tensor(0.0)
     ce_all = F.cross_entropy(logits_f, safe_target, reduction="none")
+    gamma = float(focal_gamma)
+    if gamma > 0:
+        prob = torch.softmax(logits_f, dim=1)
+        p_t = prob.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+        focal_weight = (1.0 - p_t).pow(gamma)
+        ce_all = ce_all * focal_weight
     return _finite_loss((ce_all * mask).sum() / mask.sum().clamp_min(1.0), posinf=20.0)
 
 
@@ -312,6 +323,32 @@ def anatomy_prior_penalty(
     return _finite_loss((p_frac * (1.0 - p_anat_fg).clamp_min(0)).mean(), posinf=20.0)
 
 
+def sacrum_exclusion_loss(
+    frac_logits: torch.Tensor,
+    region_logits: torch.Tensor,
+    side_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Penalise fracture predictions on sacrum.
+
+    For datasets without sacrum fractures, this explicitly suppresses
+    P(frac) wherever P(sacrum|anatomy) is high.
+    """
+    region_logits_f = _finite_logits(region_logits, clamp=30.0)
+    side_logits_f = _finite_logits(side_logits, clamp=30.0)
+    frac_logits_f = _finite_logits(frac_logits, clamp=30.0)
+
+    eps = 1e-7
+    pr = torch.softmax(region_logits_f, dim=1)
+    ps = torch.softmax(side_logits_f, dim=1)
+    p_sacrum = pr[:, 1:2]  # region class 1 = sacrum
+
+    if p_sacrum.shape[2:] != frac_logits_f.shape[2:]:
+        p_sacrum = F.interpolate(p_sacrum, size=frac_logits_f.shape[2:], mode="trilinear", align_corners=False)
+
+    p_frac = torch.sigmoid(frac_logits_f)
+    return _finite_loss((p_frac * p_sacrum.clamp_min(0)).mean(), posinf=20.0)
+
+
 # ---------------------------------------------------------------------------
 # Clean loss class
 # ---------------------------------------------------------------------------
@@ -324,11 +361,13 @@ class CleanLossWeights:
     anatomy_late: float = 0.10
     sacfrac: float = 0.50
     prior: float = 0.02
+    sacrum_exclusion: float = 0.0
     focal_alpha: float = 0.75
     focal_gamma: float = 2.0
     small_component: float = 0.25
     geometry: float = 0.50
     struct: float = 0.10
+    side_focal_gamma: float = 0.0
     geometry_start_epoch: int = 20
     small_component_start_epoch: int = 40
     struct_downsample_factor: int = 2
@@ -410,13 +449,23 @@ class AGSSCleanLoss(torch.nn.Module):
             if "region" in output:
                 loss = loss + anat_w * region_ce_loss(_highest_resolution(output["region"]), region_t)
             if "side" in output:
-                loss = loss + anat_w * masked_side_ce_loss(_highest_resolution(output["side"]), side_t)
+                loss = loss + anat_w * masked_side_ce_loss(
+                    _highest_resolution(output["side"]), side_t,
+                    focal_gamma=self.weights.side_focal_gamma,
+                )
 
         if "sacfrac" in output and self.weights.sacfrac > 0:
             loss = loss + self.weights.sacfrac * bce_dice_loss(_highest_resolution(output["sacfrac"]), sacfrac_t)
 
         if self.weights.prior > 0 and "frac" in output and "region" in output and "side" in output:
             loss = loss + self.weights.prior * anatomy_prior_penalty(
+                _highest_resolution(output["frac"]),
+                _highest_resolution(output["region"]),
+                _highest_resolution(output["side"]),
+            )
+
+        if self.weights.sacrum_exclusion > 0 and "frac" in output and "region" in output and "side" in output:
+            loss = loss + self.weights.sacrum_exclusion * sacrum_exclusion_loss(
                 _highest_resolution(output["frac"]),
                 _highest_resolution(output["region"]),
                 _highest_resolution(output["side"]),
