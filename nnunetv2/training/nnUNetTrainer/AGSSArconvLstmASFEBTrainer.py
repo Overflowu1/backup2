@@ -1348,15 +1348,19 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
     - L_prior (0.02): anatomy prior penalty
     """
 
-    # Network: clean, no heavy modules
+    # Network: clean backbone plus lightweight bottleneck/skip/laterality modules
     agss_use_acfa = True
     agss_use_um_fusion = False
     agss_use_xlstm = False
     agss_arconv_stage_idxs = ()
     agss_arconv_weight = 0.0
     agss_use_skip_se = False
-    agss_use_coord_map = False
+    agss_use_coord_map = False  # keep dataloader z/y/x coord maps off for Clean; LR coord is injected in side head.
     agss_use_raw_sem_aux = False
+    agss_use_arconv_lite = True
+    agss_use_skip_eca = True
+    agss_use_lr_coord = True
+    agss_use_sacfrac_head = True
 
     # Disable old AGSS auxiliary loss mechanism (we use AGSSCleanLoss instead)
     agss_enable_auxiliary = False
@@ -1383,6 +1387,9 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
     clean_small_component_weight = 0.25
     clean_geometry_weight = 0.50
     clean_struct_weight = 0.10
+    clean_geometry_start_epoch = 20
+    clean_small_component_start_epoch = 40
+    clean_struct_downsample_factor = 2
     agss_use_sci = True
     agss_sci_detach_struct = True
 
@@ -1391,7 +1398,8 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
     agss_fg_classes = (4, 1, 2, 3)
     agss_fg_class_weights = (0.50, 0.20, 0.15, 0.15)
     agss_sacrum_frac_oversample_ratio = 0.0
-    agss_cache_aux_in_ram = False
+    # Cache precomputed AGSS aux maps to avoid repeated disk I/O for 9-channel targets.
+    agss_cache_aux_in_ram = True
 
     # Fracture-centric checkpoint
     agss_best_fracture_metric = 'agss_val_binfrac_dice'
@@ -1401,6 +1409,9 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
 
     # Validation
     agss_print_extra_val_metrics = True
+    # Compute AGSS-Clean extra validation metrics sparsely; nnU-Net Dice still runs every epoch.
+    agss_clean_val_metrics_every = 5
+    agss_clean_val_metrics_first_n_epochs = 5
     agss_full_val_metrics_every = 20
     agss_full_val_metrics_first_n_epochs = 0
 
@@ -1431,6 +1442,10 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             sci_detach_struct=getattr(cls, 'agss_sci_detach_struct', True),
             use_hierarchical_assembly=getattr(cls, 'agss_use_hierarchical_assembly', True),
             use_struct_head=use_struct_head,
+            use_sacfrac_head=getattr(cls, 'agss_use_sacfrac_head', True),
+            use_arconv_lite=getattr(cls, 'agss_use_arconv_lite', True),
+            use_skip_eca=getattr(cls, 'agss_use_skip_eca', True),
+            use_lr_coord=getattr(cls, 'agss_use_lr_coord', True),
         )
         from dynamic_network_architectures.initialization.weight_init import InitWeights_He
         model.apply(InitWeights_He(1e-2))
@@ -1455,6 +1470,9 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             small_component=getattr(self, "clean_small_component_weight", 0.25),
             geometry=getattr(self, "clean_geometry_weight", 0.50),
             struct=getattr(self, "clean_struct_weight", 0.10),
+            geometry_start_epoch=getattr(self, "clean_geometry_start_epoch", 20),
+            small_component_start_epoch=getattr(self, "clean_small_component_start_epoch", 40),
+            struct_downsample_factor=getattr(self, "clean_struct_downsample_factor", 2),
         )
         self._clean_loss = AGSSCleanLoss(
             weights=weights,
@@ -1526,6 +1544,16 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             self.optimizer.step()
         return {'loss': l.detach().cpu().numpy()}
 
+    def _do_clean_extra_val_metrics(self) -> bool:
+        every = int(getattr(self, 'agss_clean_val_metrics_every', 1))
+        first_n = int(getattr(self, 'agss_clean_val_metrics_first_n_epochs', 0))
+        epoch = int(getattr(self, 'current_epoch', 0))
+        if epoch < first_n:
+            return True
+        if every <= 0:
+            return False
+        return (epoch % every) == 0
+
     def validation_step(self, batch: dict) -> dict:
         self._apply_agss_loss_schedule()
         data = batch['data'].to(self.device, non_blocking=True)
@@ -1563,7 +1591,7 @@ class AGSSArconvLstmASFEBTrainer_Clean(AGSSArconvLstmASFEBTrainer):
             fn_hard = fn_hard[1:]
 
         ret = {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
-        if self.agss_print_extra_val_metrics:
+        if self.agss_print_extra_val_metrics and self._do_clean_extra_val_metrics():
             ignore_label = self.label_manager.ignore_label if self.label_manager.has_ignore_label else None
             extra = _compute_agss_validation_metrics_clean(
                 output, target_combined, self.agss_fracture_label, ignore_label,
@@ -1586,6 +1614,8 @@ AGSS_CLEAN_VAL_METRIC_KEYS = [
     'agss_val_acfa_gate_mean', 'agss_val_acfa_gate_fg_mean',
     'agss_val_acfa_gate_bg_mean', 'agss_val_acfa_res_scale',
     'agss_val_sci_gate_mean', 'agss_val_sci_res_scale',
+    'agss_val_arconv_lite_routing_entropy', 'agss_val_arconv_lite_routing_max_prob',
+    'agss_val_arconv_lite_res_scale',
     'agss_val_core_mae', 'agss_val_surface_mae', 'agss_val_struct_roi_mae',
 ]
 
@@ -1702,6 +1732,12 @@ def _compute_agss_validation_metrics_clean(output, target, fracture_label=4, ign
         if torch.is_tensor(value):
             metrics[f'agss_val_{key}'] = value.detach().cpu().numpy()
 
+    # ARConv-Lite bottleneck diagnostics
+    for key in ['arconv_lite_routing_entropy', 'arconv_lite_routing_max_prob', 'arconv_lite_res_scale']:
+        value = output.get(key, None)
+        if torch.is_tensor(value):
+            metrics[f'agss_val_{key}'] = value.detach().cpu().numpy()
+
     # Structure field metrics (monitor D_core / D_surface prediction quality)
     if full_metrics:
         struct_pred = output.get('struct', None)
@@ -1724,6 +1760,24 @@ def _compute_agss_validation_metrics_clean(output, target, fracture_label=4, ign
 # =============================================================================
 # Clean Ablation Variants
 # =============================================================================
+
+
+class AGSSArconvLstmASFEBTrainer_Clean_HipOnly(AGSSArconvLstmASFEBTrainer_Clean):
+    """Variant for datasets with left/right hip fractures but no sacrum fractures.
+
+    Removes the sacrum-fracture auxiliary head/loss and shifts sampling/model
+    selection toward fracture and left/right hip anatomy. The main semantic
+    hierarchy still keeps sacrum as an anatomy class if labels contain it.
+    """
+    agss_use_sacfrac_head = False
+    clean_sacfrac_weight = 0.0
+    agss_best_sacfrac_weight = 0.0
+    agss_best_outside_penalty = 0.15
+    agss_fg_classes = (4, 2, 3)
+    agss_fg_class_weights = (0.60, 0.20, 0.20)
+    clean_anatomy_weight = 0.35
+    clean_anatomy_weight_late = 0.15
+    clean_prior_weight = 0.03
 
 class AGSSArconvLstmASFEBTrainer_Clean_NoACFA(AGSSArconvLstmASFEBTrainer_Clean):
     """Ablation: Clean model without ACFA. Tests ACFA's contribution."""
